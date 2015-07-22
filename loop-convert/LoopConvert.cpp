@@ -29,7 +29,7 @@ using namespace clang::driver;
 using namespace clang::tooling;
 using namespace std;
 static llvm::cl::OptionCategory ToolingSampleCategory("Tooling Sample");
-static ofstream *out;
+
 map<string, int> locals;
 map<string, int> globals;
 map<string, int> statics;
@@ -55,7 +55,12 @@ uint64_t getSizeOfQualType(const QualType *type) {
         
     }
     const Type *canonical = type->getCanonicalType().getTypePtr();
-    return getSizeOfType(canonical)*mult;//context->getTypeInfoDataSizeInChars(*type).first.getQuantity();
+    if(canonical->getBaseElementTypeUnsafe()->isCharType() && mult >= 4) {
+        return 1*mult + ((mult % 4 != 0) ? 1 : 0);
+    }else if(canonical->isArrayType())
+        return getSizeOfType(canonical->getArrayElementTypeNoTypeQual())*mult + (mult > 1 ? 4 :0);
+    else
+            return getSizeOfType(canonical)*mult + (mult > 1 ? 4 :0);
 }
 
 
@@ -161,8 +166,12 @@ uint32_t getNumVirtMethods(const CXXRecordDecl *classDecl) {
 }
 uint32_t getSizeOfType(const Type* type) {
     
-    if(type->isArrayType()) {
-        return getSizeOfType(type->getArrayElementTypeNoTypeQual());
+    if(type->isCharType()) {
+        return 1;
+} else if(isa<ConstantArrayType>(type)) {
+    const ConstantArrayType *arrType = cast<const ConstantArrayType>(type);
+    
+        return getSizeOfType(type->getArrayElementTypeNoTypeQual())*(arrType->getSize()).getSExtValue();
     } else if(type->isRecordType() && type->getAsCXXRecordDecl()) {
         CXXRecordDecl *recordDecl = type->getAsCXXRecordDecl();
         return getSizeOfCXXDecl(recordDecl, true, false);
@@ -281,20 +290,27 @@ public:
         
     }
     
-    void printDeclWithKey(string key, bool isAddr, bool isLtoRValue) {
+    void printDeclWithKey(string key, bool isAddr, bool isLtoRValue, int size = 1) {
         int index = -1;
+        
+        if(size > 1 && isLtoRValue) {
+            out << "iPush " << size << "//size" << endl;
+            isAddr = true;
+        }
+        
+        
         if(locals.find(key) != locals.end()) {
             index = locals[key];
             if(isLtoRValue && !isAddr){
                 out << frameGet(index) << " //" << key << endl;
-            return;
             }
             else if(isAddr)
                 out << pFrame(index) << " //&" << key << endl;
             else {
                 out << frameSet(index) << " //" << key << endl;
-                return;
+
             }
+ 
 
         }
         else if(globals.find(key) != globals.end()){
@@ -318,6 +334,10 @@ public:
         }else {
             out << "DeclRefExpr not implemented" << endl;
         }
+        
+        if(size > 1 && isLtoRValue) {
+            out << "ArrayToStack" << endl;
+        }
 
     }
     
@@ -340,14 +360,16 @@ public:
             Stmt *Then = IfStatement->getThen();
             Stmt *Else = IfStatement->getElse();
             
-            parseExpression(conditional);
+            parseExpression(conditional, false, true);
             out << "JumpFalse @" << (Else ? Else->getLocStart().getRawEncoding() : s->getLocEnd().getRawEncoding()) << endl;
             
             parseStatement(Then, breakLoc, continueLoc);
+            out << "Jump @" << s->getLocEnd().getRawEncoding() << endl;
             
             if(Else) {
                 out << endl << ":"<< Else->getLocStart().getRawEncoding() <<endl;
                 parseStatement(Else, breakLoc, continueLoc);
+                s->getLocEnd().getRawEncoding();
             }
             out << endl << ":"<< s->getLocEnd().getRawEncoding() <<endl;
             
@@ -359,7 +381,7 @@ public:
             Stmt *body = whileStmt->getBody();
             
             out << endl << ":" << conditional->getLocStart().getRawEncoding() << endl;
-            parseExpression(conditional);
+            parseExpression(conditional, false, true);
             out << "JumpFalse @" << whileStmt->getLocEnd().getRawEncoding()  << endl;
             parseStatement(body, whileStmt->getLocEnd().getRawEncoding(), conditional->getLocStart().getRawEncoding());
             out << "Jump @" << conditional->getLocStart().getRawEncoding() << endl;
@@ -424,13 +446,18 @@ public:
             const ReturnStmt *ret = cast<const ReturnStmt>(s);
             const Expr* retVal = ret->getRetValue();
             if(retVal)
-                parseExpression(retVal);
+                parseExpression(retVal, false, true);
             int size = 0;
             if(ret->getRetValue()){
             QualType type = ret->getRetValue()->getType();
             size = context->getTypeInfoDataSizeInChars(type).first.getQuantity();
             }
-            out << "Return " << currFunction->getNumParams() + (isa<CXXMethodDecl>(currFunction) ? 1 : 0) << " " << getSizeFromBytes(size) << endl;
+            
+            int paramSize = 0;
+            for(int i=0; i<currFunction->getNumParams(); i++) {
+                paramSize += getSizeFromBytes(getSizeOfType(currFunction->getParamDecl(i)->getType().getTypePtr()));
+            }
+            out << "Return " << paramSize + (isa<CXXMethodDecl>(currFunction) ? 1 : 0) << " " << getSizeFromBytes(size) << endl;
         } else if(isa<Expr>(s)) {
             parseExpression(cast<const Expr>(s));
         } else if(isa<BreakStmt>(s)) {
@@ -446,6 +473,9 @@ public:
             CaseStmt *caseS = cast<CaseStmt>(s);
 
                 Expr *LHS = caseS->getLHS();
+            if(isa<CastExpr>(LHS)) {
+                LHS = cast<CastExpr>(LHS)->getSubExpr();
+            }
                 if(isa<IntegerLiteral>(LHS)) {
                     IntegerLiteral *literal = cast<IntegerLiteral>(LHS);
                     out << "case @" << literal->getValue().getSExtValue() << endl;
@@ -551,20 +581,64 @@ public:
                         parseExpression(initializer, true, false, true, var);
                         return true;
                     }
-                    parseExpression(initializer);
-                    out << frameSet(oldLocalInc) << "  //" << var->getName().str() << endl;
+
+                    parseExpression(initializer, false, true);
+                    if(size > 4) {
+                        out << "iPush " << size/4 << " //Type Size" << endl;
+                        out << pFrame(oldLocalInc) << " //&" << var->getNameAsString() << endl;
+                        out << "ArrayFromStack " << endl;
+                    } else {
+                        out << frameSet(oldLocalInc) << "  //" << var->getName().str() << endl;
+                    }
                 }
             }
         }
         return true;
     }
     
+    
+    bool checkIntrinsic(const CallExpr *call) {
+        string funcName = parseCast(cast<const CastExpr>(call->getCallee()));
+        const Expr * const*argArray = call->getArgs();
+        if(funcName == "@__strcpy") {
+            parseExpression(argArray[1]);
+            parseExpression(argArray[0]);
+
+            
+            out << "scpy ";
+            
+            if(isa<IntegerLiteral>(argArray[2])) {
+                const IntegerLiteral *literal = cast<const IntegerLiteral>(argArray[2]);
+                out << literal->getValue().getSExtValue() << endl;
+            } else if(isa<CastExpr>(argArray[2])) {
+                out << parseCast(cast<const CastExpr>(argArray[2])) << endl;
+            }
+            return true;
+        }
+        return false;
+    }
 
     
     string parseCast(const CastExpr *castExpr) {
         switch(castExpr->getCastKind()) {
             case clang::CK_LValueToRValue:
                 break;
+            case clang::CK_IntegralCast:
+            {
+                const Expr *e = castExpr->getSubExpr();
+                if(isa<IntegerLiteral>(e)) {
+                    const IntegerLiteral *literal = cast<const IntegerLiteral>(e);
+                    return to_string(literal->getValue().getSExtValue());
+                } else if(isa<FloatingLiteral>(e)) {
+                    const FloatingLiteral *literal = cast<const FloatingLiteral>(e);
+                    if(&literal->getValue().getSemantics() == &llvm::APFloat::IEEEsingle)
+                        return to_string(literal->getValue().convertToFloat());
+                    else
+                        return to_string(literal->getValue().convertToDouble());
+                } else {
+                    out << "unhandled cast" << endl;
+                }
+            }
             case clang::CK_FunctionToPointerDecay:
             {
                 if(isa<DeclRefExpr>(castExpr->getSubExpr())) {
@@ -622,21 +696,43 @@ public:
                 out << "fPush " << (double)literal->getValue().convertToFloat() << endl;
             else
                 out << "fPush " << literal->getValue().convertToDouble() << endl;
-        } else if(isa<StringLiteral>(e)) {
+        } else if(isa<CompoundLiteralExpr>(e)) {
+            const CompoundLiteralExpr *cLit = cast<const CompoundLiteralExpr>(e);
+            if(isa<InitListExpr>(cLit->getInitializer())) {
+                const InitListExpr *init = cast<const InitListExpr>(cLit->getInitializer());
+                for(unsigned int i=0; i<init->getNumInits(); i++) {
+                    parseExpression(init->getInit(i));
+                }
+               // if(!printVTable)
+               //     out << "iPush " << init->getNumInits() << " // numInitializers" << endl;
+            } else {
+                parseExpression(cLit->getInitializer());
+//                out << "Unimplemented CompoundLiteralExpr" << endl;
+            }
+        }else if(isa<StringLiteral>(e)) {
             const StringLiteral *literal = cast<const StringLiteral>(e);
-            out << "PushString \"" << literal->getString().data() << "\"" << endl;
+            if(literal->getString().str().length() > 0)
+                out << "PushString \"" << literal->getString().str() << "\"" << endl;
+            else
+                out << "PushString \"\"" << endl;
         }else if(isa<CallExpr>(e)) {
             const CallExpr *call = cast<const CallExpr>(e);
+                                if(checkIntrinsic(call))
+                                    return 1;
             const Expr * const*argArray = call->getArgs();
             for(int i=0; i<call->getNumArgs(); i++) {
-                parseExpression(argArray[i]);
+                parseExpression(argArray[i], false, true);
             }
+
             if(isa<CastExpr>(call->getCallee()))
                 if(call->getDirectCallee()->isDefined())
-                    out << "Call @" << parseCast(cast<const CastExpr>(call->getCallee())) << " //NumArgs: " << call->getNumArgs() << " " << endl;
+                    out << "Call " << parseCast(cast<const CastExpr>(call->getCallee())) << " //NumArgs: " << call->getNumArgs() << " " << endl;
                 else {
+
                     const QualType type = call->getDirectCallee()->getReturnType();
                     out << "CallNative " << parseCast(cast<const CastExpr>(call->getCallee())) << " " << call->getNumArgs() << " " << getSizeFromBytes(getSizeOfQualType(&type)) << endl;
+
+//                    }
                 }
             else if(isa<MemberExpr>(call->getCallee())) {
                 const MemberExpr *expr = cast<const MemberExpr>(call->getCallee());
@@ -648,37 +744,6 @@ public:
 
                         int offset = 0;
                         printVirtualCall(classDecl, method, expr->getBase());
-                        //parseExpression(expr->getBase(), true, false);
-                    
-                
-            
-//                        for(auto VBI : classDecl->bases()) {
-//                            int slot = 0;
-//                            const CXXBaseSpecifier baseSpec = VBI;
-//                            const CXXRecordDecl *baseDecl = baseSpec.getType()->getAsCXXRecordDecl();
-//                    
-//                        uint32_t vtableOffset = 0;
-//                        bool foundVirt = false;
-//                        for(CXXMethodDecl *VFI : baseDecl->methods()) {
-//                            if(VFI->isVirtual()) {
-//                                if(!foundVirt) {
-//                                    offset+=4;
-//                                    foundVirt = true;
-//                                }
-//                                if(VFI->getDeclName() == method->getDeclName()) {
-//                                    out << "push " << slot << " //" << VFI->getDeclName().getAsString() << endl;
-//                                    out << "GetImm " << (offset-4)/4 << " //VTable: " << baseDecl->getDeclName().getAsString() << endl;
-//                                    out << "ArrayGet 1 //*VTablePtr" << endl << "pcall //" << baseDecl->getDeclName().getAsString() << endl;
-//                                    return true;
-//                                }
-//                                slot++;
-//                                
-//                            }
-//                        
-//
-                                              //  out << "Virtual methods call failed!" << endl;
-
-                    
                     } else {
 
                         parseExpression(expr->getBase(), true);
@@ -691,6 +756,14 @@ public:
             else
                 out << "Unimplemented call" << endl;
             
+            
+            if(call->getType()->isVoidType() == false) {
+                if(!isLtoRValue) {
+                    out << "pop //Function Result unused" << endl;
+                call->dump();
+                }
+            }
+            
         }else if(isa<CastExpr>(e)) {
             const CastExpr *icast = cast<const CastExpr>(e);
             switch(icast->getCastKind()){
@@ -701,21 +774,21 @@ public:
                         out << "fPush " << literal->getValue().getSExtValue() << ".0" << endl;
                         return true;
                     } else {
-                        parseExpression(icast->getSubExpr());
+                        parseExpression(icast->getSubExpr(), false, true);
                         out << "itof" <<endl;
                         return true;
                     }
                 }
                 case clang::CK_FloatingCast:
                 case clang::CK_IntegralCast:
-                    parseExpression(icast->getSubExpr());
+                    parseExpression(icast->getSubExpr(), isAddr, isLtoRValue);
                     break;
                 case clang::CK_ArrayToPointerDecay:
                     parseExpression(icast->getSubExpr(), true, false);
                     break;
                 case clang::CK_LValueToRValue:
                 {
-                    parseExpression(icast->getSubExpr(), false, true);
+                    parseExpression(icast->getSubExpr(), isAddr, true, printVTable);
                    //const Expr *subE = icast->getSubExpr();
 
                     //handleRValueDeclRef(subE);
@@ -783,6 +856,11 @@ public:
                     parseExpression(icast->getSubExpr());
                     break;
                 }
+                case clang::CK_BitCast:
+                {
+                    parseExpression(icast->getSubExpr());
+                    break;
+                }
                 default:
                     out << "Unhandled cast" << endl;
                     
@@ -798,14 +876,14 @@ public:
             }
             
             string key = declref->getNameInfo().getAsString();
-            printDeclWithKey(key, isAddr, isLtoRValue);
+            printDeclWithKey(key, isAddr, isLtoRValue, getSizeFromBytes(getSizeOfType(declref->getType().getTypePtr())));
             
             return true;
         }else if(isa<ArraySubscriptExpr>(e)) {
             return parseArraySubscriptExpr(e, isAddr, isLtoRValue);
         }else if(isa<ParenExpr>(e)) {
             const ParenExpr *parenExpr = cast<const ParenExpr>(e);
-            parseExpression(parenExpr->getSubExpr());
+            parseExpression(parenExpr->getSubExpr(), isAddr, isLtoRValue);
         }else if(isa<UnaryOperator>(e)) {
             const UnaryOperator *op = cast<const UnaryOperator>(e);
             
@@ -816,7 +894,14 @@ public:
                     out << iPush(-(literal->getValue().getSExtValue())) << endl;
                 }else if(isa<FloatingLiteral>(subE)) {
                     const FloatingLiteral *literal = cast<const FloatingLiteral>(subE);
-                    out << "fPush " << (double)-(literal->getValue().convertToDouble()) << endl;
+                    
+                    out << "fPush ";
+                    if(&literal->getValue().getSemantics() == &llvm::APFloat::IEEEsingle)
+                        out << to_string(-1.0f*literal->getValue().convertToFloat());
+                    else
+                        out << to_string(-1.0*literal->getValue().convertToDouble());
+                    out << endl;
+                   // out << "fPush " << (double)-(literal->getValue().convertToDouble()) << endl;
                 }
                 return false;
             } else if(op->getOpcode() == UO_LNot) {
@@ -829,7 +914,7 @@ public:
                     out << "fPush " << (double)-(literal->getValue().convertToDouble()) << endl;
                     
                 } else if(isa<Expr>(subE)) {
-                    parseExpression(subE);
+                    parseExpression(subE, isAddr, isLtoRValue);
                     
                 } else {
                     out << "unimplmented UO_Not" << endl;
@@ -842,9 +927,24 @@ public:
                     parseArraySubscriptExpr(subE, true);
                 } else if(isa<DeclRefExpr>(subE)){
                     parseExpression(subE, true, false);
+                } else {
+                    parseExpression(subE, true, false);
                 }
                 return  true;
                 
+            } else if(op->getOpcode() == UO_Deref) {
+                if(isa<ArraySubscriptExpr>(subE)) {
+                    parseArraySubscriptExpr(subE, false);
+                } else if(isa<DeclRefExpr>(subE)){
+                    parseExpression(subE, false, false);
+                } else {
+                    parseExpression(subE, false, false);
+                }
+                if(isLtoRValue)
+                    out << "pGet" << endl;
+                else
+                    out << "pSet" << endl;
+                return true;
             }
             
  
@@ -856,6 +956,7 @@ public:
                     parseExpression(subE, false, true);
                     out << "iPush 1" << endl;
                     out << "addi" << endl;
+                    if(isLtoRValue)
                     out << "dup" << endl;
                     parseExpression(subE);
                                         return 1;
@@ -863,6 +964,7 @@ public:
                     parseExpression(subE, false, true);
                     out << "iPush 1" << endl;
                     out << "subi" << endl;
+                    if(isLtoRValue)
                     out << "dup" << endl;
                    parseExpression(subE);
                                        return 1;
@@ -870,6 +972,7 @@ public:
             } else if(op->isPostfix()) {
                 if(op->isIncrementOp()) {
                     parseExpression(subE, false, true);
+                    if(isLtoRValue)
                     out << "dup" << endl;
                     out << "iPush 1" << endl;
                     out << "addi" << endl;
@@ -877,7 +980,9 @@ public:
                     return 1;
                 } else if(op->isDecrementOp()) {
                     parseExpression(subE, false, true);
+
                     out << "iPush 1" << endl;
+                    if(isLtoRValue)
                     out << "dup" << endl;
                     out << "subi" << endl;
                     parseExpression(subE, false, false);
@@ -911,8 +1016,16 @@ public:
             
             if(bOp->getOpcode() == BO_Assign) {
 
-                parseExpression(bOp->getRHS(), isAddr, true);
-                parseExpression(bOp->getLHS());
+                parseExpression(bOp->getRHS(), isAddr, true, false);
+                if(bOp->getRHS()->getType()->isStructureOrClassType()) {
+                    int size = getSizeFromBytes(getSizeOfType(bOp->getRHS()->getType().getTypePtr()));
+                    out << "iPush " << size << " //size " << endl;
+                    parseExpression(bOp->getLHS(), true);
+                    
+                    out << "ArrayFromStack" << endl;
+                } else {
+                    parseExpression(bOp->getLHS());
+                }
                 
                 return true;
             }
@@ -921,24 +1034,40 @@ public:
                 case BO_SubAssign:
                     parseExpression(bOp->getLHS(), false, true);
                     parseExpression(bOp->getRHS());
+                    if(bOp->getLHS()->getType()->isFloatingType())
+                        out << "f";
+                    else
+                        out << "i";
                     out << "sub" << endl;
                     parseExpression(bOp->getLHS(), false, false);
                     break;
                 case BO_AddAssign:
                     parseExpression(bOp->getLHS(), false, true);
                     parseExpression(bOp->getRHS());
+                    if(bOp->getLHS()->getType()->isFloatingType())
+                        out << "f";
+                    else
+                        out << "i";
                     out << "add" << endl;
                     parseExpression(bOp->getLHS(), false, false);
                     break;
                 case BO_DivAssign:
                     parseExpression(bOp->getLHS(), false, true);
                     parseExpression(bOp->getRHS());
+                    if(bOp->getLHS()->getType()->isFloatingType())
+                        out << "f";
+                    else
+                        out << "i";
                     out << "div" << endl;
                     parseExpression(bOp->getLHS(), false, false);
                     break;
                 case BO_MulAssign:
                     parseExpression(bOp->getLHS(), false, true);
                     parseExpression(bOp->getRHS());
+                    if(bOp->getLHS()->getType()->isFloatingType())
+                        out << "f";
+                    else
+                        out << "i";
                     out << "mul" << endl;
                     parseExpression(bOp->getLHS(), false, false);
                     break;
@@ -950,8 +1079,62 @@ public:
                     break;
                 default:
                 {
-                    parseExpression(bOp->getLHS());
-                    parseExpression(bOp->getRHS());
+                    parseExpression(bOp->getLHS(), false, true);
+                    parseExpression(bOp->getRHS(), false, true);
+                    
+                    
+                    if(bOp->getLHS()->getType()->isFloatingType()) {
+                        switch(bOp->getOpcode()) {
+                            case BO_EQ:
+                                out << "fcmpeq" << endl;
+                                break;
+                            case BO_Mul:
+                                out << "fmul" << endl;
+                                break;
+                            case BO_Div:
+                                out << "fdiv" << endl;
+                                break;
+                            case BO_Rem:
+                                out << "fmod" << endl;
+                                break;
+                            case BO_Sub:
+                                out << "fsub" << endl;
+                                break;
+                            case BO_LT:
+                                out << "fcmplt" << endl;
+                                break;
+                            case BO_GT:
+                                out << "fcmpgt" << endl;
+                                break;
+                            case BO_GE:
+                                out << "fcmpge" << endl;
+                                break;
+                            case BO_LE:
+                                out << "fcmple" << endl;
+                                break;
+                            case BO_NE:
+                                out << "fcmpne" << endl;
+                                break;
+                            case BO_LAnd:
+                            case BO_And:
+                                out << "iand" << endl;
+                                break;
+                            case BO_Xor:
+                                out << "ixor" << endl;
+                                break;
+                            case BO_Add:
+                                out << "fadd" << endl;
+                                break;
+                            case BO_LOr:
+                            case BO_Or:
+                                out << "or " << endl;
+                                break;
+                                
+                            default:
+                                out << "unimplemented2 " << bOp->getOpcode() << endl;
+                        }
+
+                    } else {
                     switch(bOp->getOpcode()) {
                         case BO_EQ:
                             out << "icmpeq" << endl;
@@ -991,7 +1174,7 @@ public:
                             out << "ixor" << endl;
                             break;
                         case BO_Add:
-                            out << "add" << endl;
+                            out << "iadd" << endl;
                             break;
                         case BO_LOr:
                         case BO_Or:
@@ -1000,6 +1183,7 @@ public:
                             
                         default:
                             out << "unimplemented2 " << bOp->getOpcode() << endl;
+                    }
                     }
 
                 }
@@ -1183,6 +1367,7 @@ public:
         
     }
 
+    
     bool parseArraySubscriptExpr(const Expr *e, bool addrOf, bool LValueToRValue = false) {
         const ArraySubscriptExpr *arr = cast<const ArraySubscriptExpr>(e);
         const Expr *base = arr->getBase();
@@ -1190,12 +1375,18 @@ public:
         
 
         parseExpression(index);
-        parseExpression(base);
+        parseExpression(base, true);
         const DeclRefExpr *declRef = getDeclRefExpr(base);
-        const Type *type = declRef->getType().getTypePtr()->getArrayElementTypeNoTypeQual();
+        const Type *type = base->getType().getTypePtr();//declRef->getType().getTypePtr()->getArrayElementTypeNoTypeQual();
+        if(type == NULL) {
+            type = declRef->getType().getTypePtr();
+        }
         if(declRef) {
             declRef->getType();
         }
+        if(type->isPointerType())
+            type = type->getPointeeType().getTypePtr();
+        
         if(LValueToRValue)
              out << "ArrayGet " << getSizeFromBytes(getSizeOfType(type)) << endl;
         else if(addrOf)
@@ -1214,10 +1405,15 @@ public:
                 return true;
             Stmt *FuncBody = f->getBody();
             
+            int paramSize = 0;
+            for(int i=0; i<f->getNumParams(); i++) {
+                paramSize += getSizeFromBytes(getSizeOfType(f->getParamDecl(i)->getType().getTypePtr()));
+            }
+            
             out << endl << " //FuncBegin" << endl;
             out << endl << endl << ":@" << f->getBody()->getLocStart().getRawEncoding()  << endl << ":" << dumpName(cast<NamedDecl>(f)) << endl;
             
-            string funcString = "Function 1 " + to_string(f->getNumParams() + (isa<CXXMethodDecl>(f) ? 1 : 0)) + " " + getNameForFunc(f) + "\n" + "{\n";
+            string funcString = "Function 1 " + to_string(paramSize + (isa<CXXMethodDecl>(f) ? 1 : 0)) + " " + getNameForFunc(f) + "\n" + "{\n";
             out << funcString;
             
             
@@ -1235,13 +1431,20 @@ public:
             parseStatement(FuncBody);
             
             if(f->getReturnType().getTypePtr()->isVoidType()) {
-                out << "return " << f->getNumParams() + (isa<CXXMethodDecl>(f) ? 1 : 0) << " 0" << endl;
+                int paramSize = 0;
+                for(int i=0; i<f->getNumParams(); i++) {
+                    paramSize += getSizeFromBytes(getSizeOfType(f->getParamDecl(i)->getType().getTypePtr()));
+                }
+                
+                out << "return " << paramSize + (isa<CXXMethodDecl>(f) ? 1 : 0) << " 0" << endl;
             }
             out << "} ";
             out << "#FuncEnd L " << localInc - isa<CXXMethodDecl>(f) << endl << endl;
             
             outfile << out.str();
+            out.str(string(""));
             out.clear();
+            
         }
         
         return true;
@@ -1417,7 +1620,12 @@ public:
 
 
             parseStatement(CS->getBody());
-            out << "Return " << currFunction->getNumParams() + (isa<CXXMethodDecl>(currFunction)) << " 0" << endl;
+            
+            int paramSize = 0;
+            for(int i=0; i<currFunction->getNumParams(); i++) {
+                paramSize += getSizeFromBytes(getSizeOfType(currFunction->getParamDecl(i)->getType().getTypePtr()));
+            }
+            out << "Return " << paramSize + (isa<CXXMethodDecl>(currFunction)) << " 0" << endl;
             out << "} ";
             out << "#FuncEnd L " << localInc - isa<CXXMethodDecl>(CS) << endl << endl;
             
@@ -1433,7 +1641,7 @@ public:
         return true;
     }
 
-private:
+public:
     Rewriter &TheRewriter;
     ASTContext *context;
     stringstream out;
@@ -1501,8 +1709,7 @@ public:
 private:
     Rewriter &TheRewriter;
     ASTContext *context;
-    
-};
+    };
 
 class LocalsVisitor : public RecursiveASTVisitor<GlobalsVisitor> {
 public:
@@ -1568,7 +1775,7 @@ public:
         for (DeclGroupRef::iterator b = DR.begin(), e = DR.end(); b != e; ++b) {
             // Traverse the declaration using our AST visitor.
             GlobalsVisitor.TraverseDecl(*b);
-            (*b)->dump();
+//            (*b)->dump();
         }
         
         for (DeclGroupRef::iterator b = DR.begin(), e = DR.end(); b != e; ++b) {
@@ -1576,7 +1783,11 @@ public:
             Visitor.TraverseDecl(*b);
             //(*b)->dump();
         }
+
         return true;
+    }
+    ~MyASTConsumer() {
+        Visitor.outfile << "#Statics " << staticInc << endl;
     }
     
 private:
